@@ -260,6 +260,7 @@ fn process_stream_line(
 
     for (delta, thinking) in deltas {
         if delta.is_empty() { continue; }
+        *estimated_tokens += estimate_token_count(&delta);
         if thinking {
             if THINKING_LOG_ENABLED.load(Ordering::SeqCst) == 0 {
                 // A disabled log keeps no decoded reasoning state.  If the
@@ -274,7 +275,7 @@ fn process_stream_line(
                         input.id,
                         StreamTarget::Thinking,
                         "<think>\n".to_string(),
-                        0,
+                        *estimated_tokens,
                         input.started_at_us,
                     );
                 }
@@ -284,7 +285,7 @@ fn process_stream_line(
                     input.id,
                     StreamTarget::Thinking,
                     delta,
-                    0,
+                    *estimated_tokens,
                     input.started_at_us,
                 );
             }
@@ -296,7 +297,7 @@ fn process_stream_line(
                         input.id,
                         StreamTarget::Thinking,
                         "\n</think>\n\n".to_string(),
-                        0,
+                        *estimated_tokens,
                         input.started_at_us,
                     );
                 }
@@ -304,7 +305,6 @@ fn process_stream_line(
                 *in_thinking = false;
             }
             response_text.push_str(&delta);
-            *estimated_tokens = estimate_token_count(response_text);
             unsafe {
                 queue_stream_update(
                     input.id,
@@ -453,7 +453,6 @@ pub unsafe extern "C" fn on_stream_update(user_data: GPointer) -> GBoolean {
     if req.id != update.request_id || req.completed.load(Ordering::SeqCst) != 0 { return G_FALSE; }
     if update.target == StreamTarget::Thinking {
         crate::ui::append_thinking_log(&update.delta);
-        return G_FALSE;
     }
     crate::ui::update_copilot_panel_stats(update.estimated_tokens, update.tokens_per_second);
     G_FALSE

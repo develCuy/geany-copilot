@@ -5,8 +5,9 @@ use crate::backend::{
 use crate::ffi::glib::*;
 use crate::ffi::geany::GeanyPlugin;
 use crate::globals::{
-    with_global_state, ACTIVE_PRESET_INDEX, CURL_TIMEOUT_INDEX, MAX_TOKENS,
-    THINKING_LOG_ENABLED,
+    with_global_state, ACTIVE_PRESET_INDEX, CURL_TIMEOUT_INDEX, DEFAULT_THINKING_LOG_MSGWIN_SPLIT,
+    MAX_TOKENS, THINKING_LOG_ENABLED, THINKING_LOG_LOCATION, THINKING_LOG_LOCATION_MESSAGE_WINDOW,
+    THINKING_LOG_LOCATION_SIDEBAR, THINKING_LOG_MSGWIN_SPLIT,
 };
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -142,6 +143,8 @@ pub unsafe fn load_config(plugin: *mut GeanyPlugin) {
     let mut timeout_idx = DEFAULT_CURL_TIMEOUT_INDEX as i32;
     let mut max_tokens = 0i32;
     let mut thinking_log_enabled = 1i32;
+    let mut thinking_log_location = THINKING_LOG_LOCATION_SIDEBAR;
+    let mut msgwin_split = DEFAULT_THINKING_LOG_MSGWIN_SPLIT;
 
     if loaded != 0 && error.is_null() {
         active_idx = key_file_get_integer_default(key_file, CONFIG_GROUP_SETTINGS, "active_preset", 0);
@@ -159,6 +162,26 @@ pub unsafe fn load_config(plugin: *mut GeanyPlugin) {
             "thinking_log_enabled",
             1,
         );
+        let loc_str = key_file_get_string_default(
+            key_file,
+            CONFIG_GROUP_SETTINGS,
+            "thinking_log_location",
+            "sidebar",
+        );
+        thinking_log_location = if loc_str.eq_ignore_ascii_case("message_window")
+            || loc_str.eq_ignore_ascii_case("msgwin")
+            || loc_str.eq_ignore_ascii_case("bottom")
+        {
+            THINKING_LOG_LOCATION_MESSAGE_WINDOW
+        } else {
+            THINKING_LOG_LOCATION_SIDEBAR
+        };
+        msgwin_split = key_file_get_integer_default(
+            key_file,
+            CONFIG_GROUP_SETTINGS,
+            "msgwin_split_percent",
+            DEFAULT_THINKING_LOG_MSGWIN_SPLIT,
+        ).clamp(20, 95);
 
         let preset_count = key_file_get_integer_default(key_file, CONFIG_GROUP_SETTINGS, "preset_count", 0);
         for i in 0..preset_count {
@@ -212,6 +235,8 @@ pub unsafe fn load_config(plugin: *mut GeanyPlugin) {
     CURL_TIMEOUT_INDEX.store(timeout_idx, Ordering::SeqCst);
     MAX_TOKENS.store(max_tokens, Ordering::SeqCst);
     THINKING_LOG_ENABLED.store((thinking_log_enabled != 0) as i32, Ordering::SeqCst);
+    THINKING_LOG_LOCATION.store(thinking_log_location, Ordering::SeqCst);
+    THINKING_LOG_MSGWIN_SPLIT.store(msgwin_split, Ordering::SeqCst);
 
     with_global_state(|state| {
         let active_preset = &loaded_presets[active_idx as usize];
@@ -243,6 +268,12 @@ pub unsafe fn save_config(plugin: *mut GeanyPlugin) {
     let timeout_sec = crate::backend::active_curl_timeout_seconds(timeout_idx);
     let max_tokens = MAX_TOKENS.load(Ordering::SeqCst).max(0);
     let thinking_log_enabled = THINKING_LOG_ENABLED.load(Ordering::SeqCst);
+    let thinking_log_location = THINKING_LOG_LOCATION.load(Ordering::SeqCst);
+    let location_str = if thinking_log_location == THINKING_LOG_LOCATION_MESSAGE_WINDOW {
+        "message_window"
+    } else {
+        "sidebar"
+    };
 
     g_key_file_set_integer(key_file, c_settings.as_ptr(), CString::new("active_preset").unwrap().as_ptr(), active_idx);
     g_key_file_set_integer(key_file, c_settings.as_ptr(), CString::new("curl_timeout").unwrap().as_ptr(), timeout_sec as i32);
@@ -252,6 +283,19 @@ pub unsafe fn save_config(plugin: *mut GeanyPlugin) {
         c_settings.as_ptr(),
         CString::new("thinking_log_enabled").unwrap().as_ptr(),
         (thinking_log_enabled != 0) as i32,
+    );
+    g_key_file_set_string(
+        key_file,
+        c_settings.as_ptr(),
+        CString::new("thinking_log_location").unwrap().as_ptr(),
+        CString::new(location_str).unwrap().as_ptr(),
+    );
+    let msgwin_split = THINKING_LOG_MSGWIN_SPLIT.load(Ordering::SeqCst).clamp(20, 95);
+    g_key_file_set_integer(
+        key_file,
+        c_settings.as_ptr(),
+        CString::new("msgwin_split_percent").unwrap().as_ptr(),
+        msgwin_split,
     );
 
     with_global_state(|state| {
@@ -386,6 +430,12 @@ mod tests {
                 assert_eq!(state.presets[0].name, "Local Ollama");
             });
             assert_eq!(ACTIVE_PRESET_INDEX.load(Ordering::SeqCst), 0);
+            assert_eq!(THINKING_LOG_ENABLED.load(Ordering::SeqCst), 1);
+            assert_eq!(THINKING_LOG_LOCATION.load(Ordering::SeqCst), THINKING_LOG_LOCATION_SIDEBAR);
+            assert_eq!(
+                THINKING_LOG_MSGWIN_SPLIT.load(Ordering::SeqCst),
+                DEFAULT_THINKING_LOG_MSGWIN_SPLIT
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -416,6 +466,8 @@ mod tests {
             CURL_TIMEOUT_INDEX.store(2, Ordering::SeqCst);
             MAX_TOKENS.store(512, Ordering::SeqCst);
             THINKING_LOG_ENABLED.store(0, Ordering::SeqCst);
+            THINKING_LOG_LOCATION.store(THINKING_LOG_LOCATION_MESSAGE_WINDOW, Ordering::SeqCst);
+            THINKING_LOG_MSGWIN_SPLIT.store(65, Ordering::SeqCst);
             save_config(fake.ptr());
 
             let conf = dir.join("plugins/geany-copilot/geany-copilot.conf");
@@ -434,12 +486,16 @@ mod tests {
             CURL_TIMEOUT_INDEX.store(0, Ordering::SeqCst);
             MAX_TOKENS.store(0, Ordering::SeqCst);
             THINKING_LOG_ENABLED.store(1, Ordering::SeqCst);
+            THINKING_LOG_LOCATION.store(THINKING_LOG_LOCATION_SIDEBAR, Ordering::SeqCst);
+            THINKING_LOG_MSGWIN_SPLIT.store(DEFAULT_THINKING_LOG_MSGWIN_SPLIT, Ordering::SeqCst);
             load_config(fake.ptr());
 
             assert_eq!(ACTIVE_PRESET_INDEX.load(Ordering::SeqCst), 1);
             assert_eq!(CURL_TIMEOUT_INDEX.load(Ordering::SeqCst), 2);
             assert_eq!(MAX_TOKENS.load(Ordering::SeqCst), 512);
             assert_eq!(THINKING_LOG_ENABLED.load(Ordering::SeqCst), 0);
+            assert_eq!(THINKING_LOG_LOCATION.load(Ordering::SeqCst), THINKING_LOG_LOCATION_MESSAGE_WINDOW);
+            assert_eq!(THINKING_LOG_MSGWIN_SPLIT.load(Ordering::SeqCst), 65);
             with_global_state(|state| {
                 assert_eq!(state.presets.len(), 2);
                 let p = &state.presets[1];
@@ -480,6 +536,8 @@ mod tests {
             CURL_TIMEOUT_INDEX.store(DEFAULT_CURL_TIMEOUT_INDEX as i32, Ordering::SeqCst);
             MAX_TOKENS.store(0, Ordering::SeqCst);
             THINKING_LOG_ENABLED.store(1, Ordering::SeqCst);
+            THINKING_LOG_LOCATION.store(THINKING_LOG_LOCATION_SIDEBAR, Ordering::SeqCst);
+            THINKING_LOG_MSGWIN_SPLIT.store(DEFAULT_THINKING_LOG_MSGWIN_SPLIT, Ordering::SeqCst);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

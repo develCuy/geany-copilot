@@ -6,7 +6,8 @@ use crate::ffi::gtk::*;
 use crate::ffi::scintilla::{scintilla_send_message, ScintillaObject};
 use crate::globals::{
     with_global_state, ACTIVE_PRESET_INDEX, CURL_TIMEOUT_INDEX, MAX_TOKENS,
-    THINKING_LOG_ENABLED,
+    THINKING_LOG_ENABLED, THINKING_LOG_LOCATION, THINKING_LOG_LOCATION_MESSAGE_WINDOW,
+    THINKING_LOG_LOCATION_SIDEBAR, THINKING_LOG_MSGWIN_SPLIT,
 };
 use crate::request::ask_copilot;
 use std::ffi::{CStr, CString};
@@ -36,6 +37,9 @@ pub struct PluginData {
     pub max_token_values: Vec<i32>,
     pub updating_statusbar_max_tokens_combo: bool,
     pub thinking_log_panel: *mut GtkWidget,
+    pub thinking_view: *mut GtkWidget,
+    pub payload_view: *mut GtkWidget,
+    pub error_view: *mut GtkWidget,
     pub thinking_log_buffer: *mut GtkTextBuffer,
     pub thinking_log_payload_buffer: *mut GtkTextBuffer,
     pub thinking_log_error_buffer: *mut GtkTextBuffer,
@@ -48,6 +52,10 @@ pub struct PluginData {
     pub thinking_log_paned: *mut GtkWidget,
     pub thinking_log_host_paned: *mut GtkWidget,
     pub thinking_log_editor: *mut GtkWidget,
+    pub thinking_log_msgwin_notebook: *mut GtkWidget,
+    pub thinking_log_location: i32,
+    pub msgwin_paned_last_width: i32,
+    pub setting_msgwin_paned_position: bool,
 }
 
 pub static mut P_DATA: *mut PluginData = ptr::null_mut();
@@ -328,6 +336,9 @@ pub unsafe fn install_statusbar_preset_combo(plugin: *mut GeanyPlugin) {
             max_token_values: Vec::new(),
             updating_statusbar_max_tokens_combo: false,
             thinking_log_panel: ptr::null_mut(),
+            thinking_view: ptr::null_mut(),
+            payload_view: ptr::null_mut(),
+            error_view: ptr::null_mut(),
             thinking_log_buffer: ptr::null_mut(),
             thinking_log_payload_buffer: ptr::null_mut(),
             thinking_log_error_buffer: ptr::null_mut(),
@@ -340,6 +351,10 @@ pub unsafe fn install_statusbar_preset_combo(plugin: *mut GeanyPlugin) {
             thinking_log_paned: ptr::null_mut(),
             thinking_log_host_paned: ptr::null_mut(),
             thinking_log_editor: ptr::null_mut(),
+            thinking_log_msgwin_notebook: ptr::null_mut(),
+            thinking_log_location: 0,
+            msgwin_paned_last_width: 0,
+            setting_msgwin_paned_position: false,
         }));
     }
 
@@ -468,8 +483,66 @@ pub unsafe fn install_statusbar_preset_combo(plugin: *mut GeanyPlugin) {
     gtk_box_pack_start(message_area as *mut _, max_tokens_box, G_FALSE, G_FALSE, 0);
 }
 
-/// Create or remove a dedicated right dock.  When the option is off, the dock
-/// and its GtkTextBuffer do not exist, so no UI-side reasoning history is kept.
+pub unsafe extern "C" fn on_msgwin_paned_size_allocate(
+    widget: *mut GtkWidget,
+    allocation: *mut GtkAllocation,
+    _user_data: GPointer,
+) {
+    if widget.is_null() || allocation.is_null() || P_DATA.is_null() {
+        return;
+    }
+    let width = (*allocation).width;
+    if width <= 50 {
+        return;
+    }
+    let pd = &mut *P_DATA;
+    if pd.msgwin_paned_last_width != width {
+        pd.msgwin_paned_last_width = width;
+        let split = THINKING_LOG_MSGWIN_SPLIT.load(Ordering::SeqCst).clamp(10, 95);
+        let pos = (width * split) / 100;
+        pd.setting_msgwin_paned_position = true;
+        gtk_paned_set_position(widget as *mut _, pos);
+        pd.setting_msgwin_paned_position = false;
+    }
+}
+
+pub unsafe extern "C" fn on_msgwin_paned_notify_position(
+    widget: *mut GtkWidget,
+    _pspec: GPointer,
+    _user_data: GPointer,
+) {
+    if widget.is_null() || P_DATA.is_null() {
+        return;
+    }
+    let pd = &mut *P_DATA;
+    if pd.setting_msgwin_paned_position {
+        return;
+    }
+    let width = pd.msgwin_paned_last_width;
+    if width > 100 {
+        let pos = gtk_paned_get_position(widget as *mut _);
+        if pos > 0 && pos < width {
+            let pct = ((pos as f64) / (width as f64) * 100.0).round() as i32;
+            let clamped = pct.clamp(10, 95);
+            THINKING_LOG_MSGWIN_SPLIT.store(clamped, Ordering::SeqCst);
+        }
+    }
+}
+
+pub unsafe extern "C" fn on_msgwin_paned_button_release(
+    _widget: *mut GtkWidget,
+    _event: GPointer,
+    user_data: GPointer,
+) -> GBoolean {
+    if !user_data.is_null() {
+        save_config(user_data as *mut GeanyPlugin);
+    }
+    G_FALSE
+}
+
+/// Create or remove a dedicated thinking log panel in either the sidebar dock or the message window.
+/// When the option is off, the panel and its GtkTextBuffers do not exist,
+/// so no UI-side reasoning history is kept.
 pub unsafe fn set_thinking_log_enabled(plugin: *mut GeanyPlugin, enabled: bool) {
     if !enabled {
         THINKING_LOG_ENABLED.store(0, Ordering::SeqCst);
@@ -483,37 +556,55 @@ pub unsafe fn set_thinking_log_enabled(plugin: *mut GeanyPlugin, enabled: bool) 
         remove_thinking_log_panel(pd);
         return;
     }
+
+    let target_location = THINKING_LOG_LOCATION.load(Ordering::SeqCst);
     if !pd.thinking_log_panel.is_null() {
-        THINKING_LOG_ENABLED.store(1, Ordering::SeqCst);
-        return;
+        if pd.thinking_log_location == target_location {
+            THINKING_LOG_ENABLED.store(1, Ordering::SeqCst);
+            return;
+        }
+        remove_thinking_log_panel(pd);
     }
     if plugin.is_null() || (*plugin).geany_data.is_null() {
         THINKING_LOG_ENABLED.store(0, Ordering::SeqCst);
         return;
     }
     let main_widgets = (*(*plugin).geany_data).main_widgets;
-    if main_widgets.is_null() || (*main_widgets).notebook.is_null() {
+    if main_widgets.is_null() {
         THINKING_LOG_ENABLED.store(0, Ordering::SeqCst);
         return;
     }
 
-    let editor = (*main_widgets).notebook;
-    let host_paned = gtk_widget_get_parent(editor);
-    // Geany's central layout is hpaned1: its second child is the document
-    // notebook.  Only alter that verified layout; never guess at a container.
-    if host_paned.is_null() || gtk_paned_get_child2(host_paned as *mut _) != editor {
-        THINKING_LOG_ENABLED.store(0, Ordering::SeqCst);
-        return;
+    if target_location == THINKING_LOG_LOCATION_SIDEBAR {
+        if (*main_widgets).notebook.is_null() {
+            THINKING_LOG_ENABLED.store(0, Ordering::SeqCst);
+            return;
+        }
+        let editor = (*main_widgets).notebook;
+        let host_paned = gtk_widget_get_parent(editor);
+        // Geany's central layout is hpaned1: its second child is the document
+        // notebook.  Only alter that verified layout; never guess at a container.
+        if host_paned.is_null() || gtk_paned_get_child2(host_paned as *mut _) != editor {
+            THINKING_LOG_ENABLED.store(0, Ordering::SeqCst);
+            return;
+        }
+    } else if target_location == THINKING_LOG_LOCATION_MESSAGE_WINDOW {
+        if (*main_widgets).message_window_notebook.is_null() {
+            THINKING_LOG_ENABLED.store(0, Ordering::SeqCst);
+            return;
+        }
     }
 
-    let panel = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
-    let header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
-    let controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
     let heading = gtk_label_new(CString::new("Copilot").unwrap().as_ptr());
     let ask_button = gtk_button_new_with_label(CString::new("Ask").unwrap().as_ptr());
     let stop_button = gtk_button_new_with_label(CString::new("Stop").unwrap().as_ptr());
     let cancel_button = gtk_button_new_with_label(CString::new("Cancel").unwrap().as_ptr());
     let clear_button = gtk_button_new_with_label(CString::new("Clear").unwrap().as_ptr());
+    let settings_button = gtk_button_new_with_label(CString::new("Settings").unwrap().as_ptr());
+    gtk_widget_set_tooltip_text(
+        settings_button,
+        CString::new("Configure Geany Copilot preferences").unwrap().as_ptr(),
+    );
     let status_label = gtk_label_new(CString::new("Ready").unwrap().as_ptr());
     let stats_label = gtk_label_new(CString::new("No active request").unwrap().as_ptr());
     let notebook = gtk_notebook_new();
@@ -526,11 +617,8 @@ pub unsafe fn set_thinking_log_enabled(plugin: *mut GeanyPlugin, enabled: bool) 
     gtk_label_set_xalign(heading as *mut _, 0.0);
     gtk_label_set_xalign(status_label as *mut _, 0.0);
     gtk_label_set_xalign(stats_label as *mut _, 0.0);
-    gtk_widget_set_margin_start(panel, 6);
-    gtk_widget_set_margin_end(panel, 6);
-    gtk_widget_set_margin_top(panel, 6);
-    gtk_widget_set_margin_bottom(panel, 6);
-    gtk_widget_set_size_request(panel, 280, -1);
+    gtk_label_set_line_wrap(status_label as *mut _, G_TRUE);
+    gtk_label_set_line_wrap(stats_label as *mut _, G_TRUE);
     for view in [thinking_view, payload_view, error_view] {
         gtk_text_view_set_editable(view as *mut _, G_FALSE);
         gtk_text_view_set_cursor_visible(view as *mut _, G_FALSE);
@@ -559,9 +647,11 @@ pub unsafe fn set_thinking_log_enabled(plugin: *mut GeanyPlugin, enabled: bool) 
         GTK_POLICY_AUTOMATIC,
         GTK_POLICY_AUTOMATIC,
     );
-    gtk_scrolled_window_set_min_content_width(thinking_scrolled as *mut _, 268);
-    gtk_scrolled_window_set_min_content_width(payload_scrolled as *mut _, 268);
-    gtk_scrolled_window_set_min_content_width(error_scrolled as *mut _, 268);
+    if target_location == THINKING_LOG_LOCATION_SIDEBAR {
+        gtk_scrolled_window_set_min_content_width(thinking_scrolled as *mut _, 268);
+        gtk_scrolled_window_set_min_content_width(payload_scrolled as *mut _, 268);
+        gtk_scrolled_window_set_min_content_width(error_scrolled as *mut _, 268);
+    }
     gtk_container_add(thinking_scrolled as *mut _, thinking_view);
     gtk_container_add(payload_scrolled as *mut _, payload_view);
     gtk_container_add(error_scrolled as *mut _, error_view);
@@ -580,30 +670,6 @@ pub unsafe fn set_thinking_log_enabled(plugin: *mut GeanyPlugin, enabled: bool) 
         error_scrolled,
         gtk_label_new(CString::new("Errors").unwrap().as_ptr()),
     );
-    let settings_scrolled = gtk_scrolled_window_new(ptr::null_mut(), ptr::null_mut());
-    gtk_scrolled_window_set_policy(
-        settings_scrolled as *mut _,
-        GTK_POLICY_AUTOMATIC,
-        GTK_POLICY_AUTOMATIC,
-    );
-    gtk_scrolled_window_set_min_content_width(settings_scrolled as *mut _, 268);
-    let settings_page = crate::configure::create_settings_page(plugin);
-    gtk_container_add(settings_scrolled as *mut _, settings_page);
-    gtk_notebook_append_page(
-        notebook as *mut _,
-        settings_scrolled,
-        gtk_label_new(CString::new("Settings").unwrap().as_ptr()),
-    );
-    gtk_box_pack_start(header as *mut _, heading, G_TRUE, G_TRUE, 0);
-    gtk_box_pack_start(header as *mut _, clear_button, G_FALSE, G_FALSE, 0);
-    gtk_box_pack_start(controls as *mut _, ask_button, G_TRUE, G_TRUE, 0);
-    gtk_box_pack_start(controls as *mut _, stop_button, G_TRUE, G_TRUE, 0);
-    gtk_box_pack_start(controls as *mut _, cancel_button, G_TRUE, G_TRUE, 0);
-    gtk_box_pack_start(panel as *mut _, header, G_FALSE, G_FALSE, 0);
-    gtk_box_pack_start(panel as *mut _, controls, G_FALSE, G_FALSE, 0);
-    gtk_box_pack_start(panel as *mut _, status_label, G_FALSE, G_FALSE, 0);
-    gtk_box_pack_start(panel as *mut _, notebook, G_TRUE, G_TRUE, 0);
-    gtk_box_pack_start(panel as *mut _, stats_label, G_FALSE, G_FALSE, 0);
     gtk_widget_set_sensitive(stop_button, G_FALSE);
     gtk_widget_set_sensitive(cancel_button, G_FALSE);
 
@@ -640,17 +706,137 @@ pub unsafe fn set_thinking_log_enabled(plugin: *mut GeanyPlugin, enabled: bool) 
         None,
         0,
     );
+    g_signal_connect_data(
+        settings_button as GPointer,
+        clicked.as_ptr(),
+        Some(std::mem::transmute::<unsafe extern "C" fn(*mut GtkWidget, GPointer), unsafe extern "C" fn()>(on_panel_settings_clicked)),
+        plugin as GPointer,
+        None,
+        0,
+    );
 
-    let right_paned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
-    // GtkContainer owns the child, so hold a temporary ref over the move.
-    g_object_ref(editor as GPointer);
-    gtk_container_remove(host_paned as *mut _, editor);
-    gtk_paned_pack1(right_paned as *mut _, editor, G_TRUE, G_TRUE);
-    g_object_unref(editor as GPointer);
-    gtk_paned_pack2(right_paned as *mut _, panel, G_FALSE, G_FALSE);
-    gtk_paned_pack2(host_paned as *mut _, right_paned, G_TRUE, G_TRUE);
+    let panel: *mut GtkWidget;
+    if target_location == THINKING_LOG_LOCATION_SIDEBAR {
+        panel = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+        let header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+        let controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+        gtk_widget_set_margin_start(panel, 6);
+        gtk_widget_set_margin_end(panel, 6);
+        gtk_widget_set_margin_top(panel, 6);
+        gtk_widget_set_margin_bottom(panel, 6);
+        gtk_widget_set_size_request(panel, 280, -1);
+        gtk_scrolled_window_set_min_content_width(thinking_scrolled as *mut _, 268);
+        gtk_scrolled_window_set_min_content_width(payload_scrolled as *mut _, 268);
+        gtk_scrolled_window_set_min_content_width(error_scrolled as *mut _, 268);
+
+        gtk_box_pack_start(header as *mut _, heading, G_TRUE, G_TRUE, 0);
+        gtk_box_pack_start(header as *mut _, clear_button, G_FALSE, G_FALSE, 0);
+        gtk_box_pack_start(header as *mut _, settings_button, G_FALSE, G_FALSE, 0);
+        gtk_box_pack_start(controls as *mut _, ask_button, G_TRUE, G_TRUE, 0);
+        gtk_box_pack_start(controls as *mut _, stop_button, G_TRUE, G_TRUE, 0);
+        gtk_box_pack_start(controls as *mut _, cancel_button, G_TRUE, G_TRUE, 0);
+        gtk_box_pack_start(panel as *mut _, header, G_FALSE, G_FALSE, 0);
+        gtk_box_pack_start(panel as *mut _, controls, G_FALSE, G_FALSE, 0);
+        gtk_box_pack_start(panel as *mut _, status_label, G_FALSE, G_FALSE, 0);
+        gtk_box_pack_start(panel as *mut _, notebook, G_TRUE, G_TRUE, 0);
+        gtk_box_pack_start(panel as *mut _, stats_label, G_FALSE, G_FALSE, 0);
+
+        let editor = (*main_widgets).notebook;
+        let host_paned = gtk_widget_get_parent(editor);
+        let right_paned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+        // GtkContainer owns the child, so hold a temporary ref over the move.
+        g_object_ref(editor as GPointer);
+        gtk_container_remove(host_paned as *mut _, editor);
+        gtk_paned_pack1(right_paned as *mut _, editor, G_TRUE, G_TRUE);
+        g_object_unref(editor as GPointer);
+        gtk_paned_pack2(right_paned as *mut _, panel, G_FALSE, G_FALSE);
+        gtk_paned_pack2(host_paned as *mut _, right_paned, G_TRUE, G_TRUE);
+
+        pd.thinking_log_paned = right_paned;
+        pd.thinking_log_host_paned = host_paned;
+        pd.thinking_log_editor = editor;
+        pd.thinking_log_msgwin_notebook = ptr::null_mut();
+        pd.msgwin_paned_last_width = 0;
+        gtk_widget_show_all(right_paned);
+    } else {
+        // Column 1 (left, default 90% width): Thinking/Payload/Errors notebook + Clear & Settings buttons
+        let col1 = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+        gtk_widget_set_margin_start(col1, 4);
+        gtk_widget_set_margin_end(col1, 4);
+        gtk_widget_set_margin_top(col1, 4);
+        gtk_widget_set_margin_bottom(col1, 4);
+
+        let col1_header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+        gtk_box_pack_start(col1_header as *mut _, heading, G_TRUE, G_TRUE, 0);
+        gtk_box_pack_start(col1_header as *mut _, clear_button, G_FALSE, G_FALSE, 0);
+        gtk_box_pack_start(col1_header as *mut _, settings_button, G_FALSE, G_FALSE, 0);
+        gtk_box_pack_start(col1 as *mut _, col1_header, G_FALSE, G_FALSE, 0);
+        gtk_box_pack_start(col1 as *mut _, notebook, G_TRUE, G_TRUE, 0);
+
+        // Column 2 (right, remaining width): Buttons: Ask, Stop, Cancel (+ status and stats)
+        let col2 = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+        gtk_widget_set_margin_start(col2, 6);
+        gtk_widget_set_margin_end(col2, 6);
+        gtk_widget_set_margin_top(col2, 4);
+        gtk_widget_set_margin_bottom(col2, 4);
+
+        gtk_box_pack_start(col2 as *mut _, ask_button, G_FALSE, G_FALSE, 0);
+        gtk_box_pack_start(col2 as *mut _, stop_button, G_FALSE, G_FALSE, 0);
+        gtk_box_pack_start(col2 as *mut _, cancel_button, G_FALSE, G_FALSE, 0);
+        gtk_box_pack_start(col2 as *mut _, status_label, G_FALSE, G_FALSE, 4);
+        gtk_box_pack_start(col2 as *mut _, stats_label, G_FALSE, G_FALSE, 2);
+
+        let paned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+        gtk_paned_pack1(paned as *mut _, col1, G_TRUE, G_FALSE);
+        gtk_paned_pack2(paned as *mut _, col2, G_FALSE, G_FALSE);
+
+        let c_size_allocate = CString::new("size-allocate").unwrap();
+        g_signal_connect_data(
+            paned as GPointer,
+            c_size_allocate.as_ptr(),
+            Some(std::mem::transmute::<unsafe extern "C" fn(*mut GtkWidget, *mut GtkAllocation, GPointer), unsafe extern "C" fn()>(on_msgwin_paned_size_allocate)),
+            plugin as GPointer,
+            None,
+            0,
+        );
+
+        let c_notify_position = CString::new("notify::position").unwrap();
+        g_signal_connect_data(
+            paned as GPointer,
+            c_notify_position.as_ptr(),
+            Some(std::mem::transmute::<unsafe extern "C" fn(*mut GtkWidget, GPointer, GPointer), unsafe extern "C" fn()>(on_msgwin_paned_notify_position)),
+            plugin as GPointer,
+            None,
+            0,
+        );
+
+        let c_button_release = CString::new("button-release-event").unwrap();
+        g_signal_connect_data(
+            paned as GPointer,
+            c_button_release.as_ptr(),
+            Some(std::mem::transmute::<unsafe extern "C" fn(*mut GtkWidget, GPointer, GPointer) -> GBoolean, unsafe extern "C" fn()>(on_msgwin_paned_button_release)),
+            plugin as GPointer,
+            None,
+            0,
+        );
+
+        panel = paned;
+        let msgwin = (*main_widgets).message_window_notebook;
+        let tab_label = gtk_label_new(CString::new("Copilot").unwrap().as_ptr());
+        gtk_notebook_append_page(msgwin as *mut _, panel, tab_label);
+
+        pd.thinking_log_paned = ptr::null_mut();
+        pd.thinking_log_host_paned = ptr::null_mut();
+        pd.thinking_log_editor = ptr::null_mut();
+        pd.thinking_log_msgwin_notebook = msgwin;
+        pd.msgwin_paned_last_width = 0;
+        gtk_widget_show_all(panel);
+    }
 
     pd.thinking_log_panel = panel;
+    pd.thinking_view = thinking_view;
+    pd.payload_view = payload_view;
+    pd.error_view = error_view;
     pd.thinking_log_buffer = gtk_text_view_get_buffer(thinking_view as *mut _);
     pd.thinking_log_payload_buffer = gtk_text_view_get_buffer(payload_view as *mut _);
     pd.thinking_log_error_buffer = gtk_text_view_get_buffer(error_view as *mut _);
@@ -660,11 +846,9 @@ pub unsafe fn set_thinking_log_enabled(plugin: *mut GeanyPlugin, enabled: bool) 
     pd.thinking_log_ask_button = ask_button;
     pd.thinking_log_stop_button = stop_button;
     pd.thinking_log_cancel_button = cancel_button;
-    pd.thinking_log_paned = right_paned;
-    pd.thinking_log_host_paned = host_paned;
-    pd.thinking_log_editor = editor;
+    pd.thinking_log_location = target_location;
+
     THINKING_LOG_ENABLED.store(1, Ordering::SeqCst);
-    gtk_widget_show_all(right_paned);
     gtk_notebook_set_current_page(notebook as *mut _, 0);
 }
 
@@ -673,9 +857,10 @@ unsafe fn remove_thinking_log_panel(pd: &mut PluginData) {
     let right_paned = pd.thinking_log_paned;
     let host_paned = pd.thinking_log_host_paned;
     let editor = pd.thinking_log_editor;
+    let msgwin = pd.thinking_log_msgwin_notebook;
 
-    if !panel.is_null() {
-        gtk_widget_destroy(panel);
+    if !msgwin.is_null() && !panel.is_null() {
+        gtk_container_remove(msgwin as *mut _, panel);
     }
     if !right_paned.is_null() && !editor.is_null() {
         g_object_ref(editor as GPointer);
@@ -691,7 +876,13 @@ unsafe fn remove_thinking_log_panel(pd: &mut PluginData) {
     if !right_paned.is_null() && host_paned.is_null() {
         gtk_widget_destroy(right_paned);
     }
+    if !panel.is_null() {
+        gtk_widget_destroy(panel);
+    }
     pd.thinking_log_panel = ptr::null_mut();
+    pd.thinking_view = ptr::null_mut();
+    pd.payload_view = ptr::null_mut();
+    pd.error_view = ptr::null_mut();
     pd.thinking_log_buffer = ptr::null_mut();
     pd.thinking_log_payload_buffer = ptr::null_mut();
     pd.thinking_log_error_buffer = ptr::null_mut();
@@ -704,9 +895,13 @@ unsafe fn remove_thinking_log_panel(pd: &mut PluginData) {
     pd.thinking_log_paned = ptr::null_mut();
     pd.thinking_log_host_paned = ptr::null_mut();
     pd.thinking_log_editor = ptr::null_mut();
+    pd.thinking_log_msgwin_notebook = ptr::null_mut();
+    pd.thinking_log_location = 0;
+    pd.msgwin_paned_last_width = 0;
+    pd.setting_msgwin_paned_position = false;
 }
 
-unsafe fn append_log_text(buffer: *mut GtkTextBuffer, text: &str) {
+unsafe fn append_log_text(view: *mut GtkWidget, buffer: *mut GtkTextBuffer, text: &str) {
     if buffer.is_null() || text.is_empty() {
         return;
     }
@@ -714,19 +909,27 @@ unsafe fn append_log_text(buffer: *mut GtkTextBuffer, text: &str) {
     let mut end = std::mem::MaybeUninit::<GtkTextIter>::zeroed().assume_init();
     gtk_text_buffer_get_end_iter(buffer, &mut end);
     gtk_text_buffer_insert(buffer, &mut end, c_text.as_ptr(), -1);
+
+    if !view.is_null() {
+        gtk_text_buffer_get_end_iter(buffer, &mut end);
+        let mark = gtk_text_buffer_create_mark(buffer, ptr::null(), &end, G_FALSE);
+        gtk_text_view_scroll_to_mark(view as *mut _, mark, 0.0, G_TRUE, 0.0, 1.0);
+        gtk_text_buffer_delete_mark(buffer, mark);
+    }
 }
 
 pub unsafe fn append_thinking_log(delta: &str) {
     if delta.is_empty() || P_DATA.is_null() || (*P_DATA).thinking_log_buffer.is_null() {
         return;
     }
-    append_log_text((*P_DATA).thinking_log_buffer, delta);
+    append_log_text((*P_DATA).thinking_view, (*P_DATA).thinking_log_buffer, delta);
 }
 
 pub unsafe fn append_copilot_error(status: &str, raw_response: &str) {
     if P_DATA.is_null() || (*P_DATA).thinking_log_error_buffer.is_null() {
         return;
     }
+    let pd = &mut *P_DATA;
     let timestamp = audit_timestamp();
     let raw_response = if raw_response.trim().is_empty() {
         "(no response body)"
@@ -734,11 +937,26 @@ pub unsafe fn append_copilot_error(status: &str, raw_response: &str) {
         raw_response
     };
     append_log_text(
-        (*P_DATA).thinking_log_error_buffer,
+        pd.error_view,
+        pd.thinking_log_error_buffer,
         &format!("[{}] {}\n{}\n\n\n", timestamp, status, raw_response),
     );
-    if !(*P_DATA).thinking_log_notebook.is_null() {
-        gtk_notebook_set_current_page((*P_DATA).thinking_log_notebook as *mut _, 2);
+    if !pd.thinking_log_notebook.is_null() {
+        gtk_notebook_set_current_page(pd.thinking_log_notebook as *mut _, 2);
+    }
+    if pd.thinking_log_location == THINKING_LOG_LOCATION_MESSAGE_WINDOW
+        && !pd.thinking_log_msgwin_notebook.is_null()
+    {
+        let page_num = gtk_notebook_page_num(
+            pd.thinking_log_msgwin_notebook as *mut _,
+            pd.thinking_log_panel,
+        );
+        if page_num >= 0 {
+            gtk_notebook_set_current_page(
+                pd.thinking_log_msgwin_notebook as *mut _,
+                page_num,
+            );
+        }
     }
 }
 
@@ -772,10 +990,12 @@ pub unsafe fn begin_copilot_request(
         let model = if model.is_empty() { "server default" } else { model };
         let timestamp = audit_timestamp();
         append_log_text(
+            pd.thinking_view,
             pd.thinking_log_buffer,
             &format!("[{}] Thinking — {}\n", timestamp, model),
         );
         append_log_text(
+            pd.payload_view,
             pd.thinking_log_payload_buffer,
             &format!(
                 "[{}] Request — {}\nPOST {}\n{}{}\n\n\n",
@@ -792,6 +1012,20 @@ pub unsafe fn begin_copilot_request(
         );
         if !pd.thinking_log_notebook.is_null() {
             gtk_notebook_set_current_page(pd.thinking_log_notebook as *mut _, 0);
+        }
+        if pd.thinking_log_location == THINKING_LOG_LOCATION_MESSAGE_WINDOW
+            && !pd.thinking_log_msgwin_notebook.is_null()
+        {
+            let page_num = gtk_notebook_page_num(
+                pd.thinking_log_msgwin_notebook as *mut _,
+                pd.thinking_log_panel,
+            );
+            if page_num >= 0 {
+                gtk_notebook_set_current_page(
+                    pd.thinking_log_msgwin_notebook as *mut _,
+                    page_num,
+                );
+            }
         }
     }
     set_copilot_panel_status("Waiting for response...", "0 tokens | 0.0 t/s", true);
@@ -812,7 +1046,7 @@ pub unsafe fn finish_copilot_request(status: &str) {
     }
     let pd = &mut *P_DATA;
     if !pd.thinking_log_panel.is_null() {
-        append_log_text(pd.thinking_log_buffer, "\n\n\n");
+        append_log_text(pd.thinking_view, pd.thinking_log_buffer, "\n\n\n");
     }
     set_copilot_panel_status(status, "No active request", false);
 }
@@ -878,6 +1112,14 @@ pub unsafe extern "C" fn on_panel_clear_clicked(_button: *mut GtkWidget, _user_d
             gtk_text_buffer_set_text(buffer, CString::new("").unwrap().as_ptr(), -1);
         }
     }
+}
+
+pub unsafe extern "C" fn on_panel_settings_clicked(_button: *mut GtkWidget, user_data: GPointer) {
+    let plugin = user_data as *mut GeanyPlugin;
+    if plugin.is_null() {
+        return;
+    }
+    crate::configure::show_settings_dialog(plugin);
 }
 
 pub unsafe fn switch_to_next_preset(plugin: *mut GeanyPlugin) {
@@ -967,7 +1209,8 @@ mod tests {
             on_panel_stop_clicked(ptr::null_mut(), ptr::null_mut());
             on_panel_cancel_clicked(ptr::null_mut(), ptr::null_mut());
             on_panel_clear_clicked(ptr::null_mut(), ptr::null_mut());
-            append_log_text(ptr::null_mut(), "x");
+            on_panel_settings_clicked(ptr::null_mut(), ptr::null_mut());
+            append_log_text(ptr::null_mut(), ptr::null_mut(), "x");
             append_thinking_log("x");
             append_copilot_error("status", "raw");
             begin_copilot_request("model", "url", "payload", true);
@@ -975,9 +1218,15 @@ mod tests {
             finish_copilot_request("done");
             set_copilot_panel_cancelling(true);
             set_copilot_panel_cancelling(false);
+            on_msgwin_paned_size_allocate(ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
+            on_msgwin_paned_notify_position(ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
+            on_msgwin_paned_button_release(ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
 
             set_thinking_log_enabled(ptr::null_mut(), false);
             assert_eq!(THINKING_LOG_ENABLED.load(Ordering::SeqCst), 0);
+            THINKING_LOG_LOCATION.store(THINKING_LOG_LOCATION_MESSAGE_WINDOW, Ordering::SeqCst);
+            set_thinking_log_enabled(ptr::null_mut(), true); // P_DATA null: no-op
+            THINKING_LOG_LOCATION.store(THINKING_LOG_LOCATION_SIDEBAR, Ordering::SeqCst);
             set_thinking_log_enabled(ptr::null_mut(), true); // P_DATA null: no-op
             THINKING_LOG_ENABLED.store(1, Ordering::SeqCst);
         }

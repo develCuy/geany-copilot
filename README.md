@@ -16,11 +16,15 @@ from that.
 
 - Toolbar button ("Ask Copilot") plus two configurable keybindings (see
   [Usage](#usage))
-- A sidebar panel showing the request payload, any error, and — for
-  reasoning models — a live "thinking" log, styled to match your editor's
-  color scheme. Live token count and tokens/second are shown while a
-  request is running, with **Stop** (keep the partial response) and
-  **Cancel** (discard it) buttons
+- A dockable panel (in the right-side sidebar or bottom message window)
+  showing the request payload, any error, and — for reasoning models — a live
+  "thinking" log, styled to match your editor's color scheme. In the message
+  window, a horizontal two-column layout displays the log notebook and
+  Clear / Settings buttons in Column 1 (left, default 90% width) and the Ask,
+  Stop, Cancel action buttons and status in Column 2 (right); resizing the
+  divider is automatically remembered.
+  Live token count and tokens/second are shown while a request is running, with
+  **Stop** (keep the partial response) and **Cancel** (discard it) buttons
 - Two backend types, selectable per preset:
   - **Ollama** (local models)
   - **OpenAI-compatible** APIs (OpenAI, DeepSeek, and other compatible
@@ -47,9 +51,10 @@ cursor. That context (plus the optional language hint and system prompt) is
 sent to the configured backend over `curl`, streamed via SSE.
 
 Note that streaming only drives the **live stats and thinking log** in the
-sidebar panel while the request is in flight — the response itself is
-inserted into your document once as a whole, when the request completes (or
-when you click **Stop**), not incrementally line-by-line.
+Copilot panel (sidebar or bottom message window) while the request is in
+flight — the response itself is inserted into your document once as a whole,
+when the request completes (or when you click **Stop**), not incrementally
+line-by-line.
 
 Only one request can be in flight at a time; triggering "Ask Copilot" while
 a request is already running is a no-op.
@@ -108,8 +113,8 @@ make uninstall
 
 ## Configuration
 
-Open **Tools → Preferences → Geany Copilot** (or click the preset editor
-from the plugin) to manage presets:
+Open **Tools → Preferences → Geany Copilot** (or click the **Settings**
+button next to **Clear** in the Copilot panel) to manage presets and options:
 
 - **Add / Save / Delete** a preset
 - **Backend type**: Ollama or OpenAI-compatible
@@ -119,6 +124,8 @@ from the plugin) to manage presets:
 - **Temperature** (0.0–2.0, leave blank to let the server decide)
 - **Insert mode**: cursor / replace selection / append after selection
 - **Include language hint** toggle
+- **Thinking log**: toggle enable/disable, with placement option for Sidebar
+  or Message Window (bottom panel)
 
 Request timeout and max response tokens are set from the status bar
 dropdowns and apply to all presets.

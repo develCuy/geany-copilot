@@ -1,4 +1,4 @@
-use crate::ffi::glib::{GBoolean, GCallback, GChar, GDestroyNotify, GPointer};
+use crate::ffi::glib::{GBoolean, GCallback, GChar, GDestroyNotify, GDouble, GPointer};
 use std::os::raw::{c_int, c_ulong, c_void};
 
 pub const GTK_ORIENTATION_HORIZONTAL: c_int = 0;
@@ -31,6 +31,7 @@ pub type GtkToolItem = c_void;
 pub type GtkToolbar = c_void;
 pub type GtkTextView = c_void;
 pub type GtkTextBuffer = c_void;
+pub type GtkTextMark = c_void;
 pub type GtkContainer = c_void;
 pub type GtkScrolledWindow = c_void;
 pub type GtkPaned = c_void;
@@ -42,6 +43,14 @@ pub struct GdkRGBA {
     pub green: f64,
     pub blue: f64,
     pub alpha: f64,
+}
+
+#[repr(C)]
+pub struct GtkAllocation {
+    pub x: c_int,
+    pub y: c_int,
+    pub width: c_int,
+    pub height: c_int,
 }
 
 pub const GTK_STATE_FLAG_NORMAL: c_int = 0;
@@ -69,6 +78,7 @@ extern "C" {
     pub fn gtk_widget_show_all(widget: *mut GtkWidget);
     pub fn gtk_widget_destroy(widget: *mut GtkWidget);
     pub fn gtk_widget_get_parent(widget: *mut GtkWidget) -> *mut GtkWidget;
+    pub fn gtk_widget_get_allocated_width(widget: *mut GtkWidget) -> c_int;
     pub fn gtk_widget_set_sensitive(widget: *mut GtkWidget, sensitive: GBoolean);
     pub fn gtk_widget_set_hexpand(widget: *mut GtkWidget, expand: GBoolean);
     pub fn gtk_widget_set_vexpand(widget: *mut GtkWidget, expand: GBoolean);
@@ -122,6 +132,7 @@ extern "C" {
         tab_label: *mut GtkWidget,
     ) -> c_int;
     pub fn gtk_notebook_set_current_page(notebook: *mut GtkNotebook, page_num: c_int);
+    pub fn gtk_notebook_page_num(notebook: *mut GtkNotebook, child: *mut GtkWidget) -> c_int;
 
     pub fn gtk_paned_new(orientation: c_int) -> *mut GtkWidget;
     pub fn gtk_paned_pack1(
@@ -137,6 +148,8 @@ extern "C" {
         shrink: GBoolean,
     );
     pub fn gtk_paned_get_child2(paned: *mut GtkPaned) -> *mut GtkWidget;
+    pub fn gtk_paned_set_position(paned: *mut GtkPaned, position: c_int);
+    pub fn gtk_paned_get_position(paned: *mut GtkPaned) -> c_int;
 
     pub fn gtk_image_new_from_icon_name(
         icon_name: *const GChar,
@@ -187,6 +200,21 @@ extern "C" {
         end: *const GtkTextIter,
         include_hidden_chars: GBoolean,
     ) -> *mut GChar;
+    pub fn gtk_text_buffer_create_mark(
+        buffer: *mut GtkTextBuffer,
+        mark_name: *const GChar,
+        where_: *const GtkTextIter,
+        left_gravity: GBoolean,
+    ) -> *mut GtkTextMark;
+    pub fn gtk_text_buffer_delete_mark(buffer: *mut GtkTextBuffer, mark: *mut GtkTextMark);
+    pub fn gtk_text_view_scroll_to_mark(
+        text_view: *mut GtkTextView,
+        mark: *mut GtkTextMark,
+        within_margin: GDouble,
+        use_align: GBoolean,
+        xalign: GDouble,
+        yalign: GDouble,
+    );
     pub fn gtk_dialog_new_with_buttons(
         title: *const GChar,
         parent: *mut GtkWindow,

@@ -8,7 +8,7 @@ pub mod request;
 pub mod test_support;
 pub mod ui;
 
-use config::load_config;
+use config::{load_config, save_config};
 use configure::copilot_plugin_configure;
 use ffi::geany::*;
 use ffi::glib::*;
@@ -100,6 +100,7 @@ unsafe extern "C" fn copilot_plugin_init(plugin: *mut GeanyPlugin, _user_data: G
 
 unsafe extern "C" fn copilot_plugin_cleanup(_plugin: *mut GeanyPlugin, _user_data: GPointer) {
     abandon_active_request();
+    save_config(_plugin);
 
     if !P_DATA.is_null() {
         let pd = Box::from_raw(P_DATA);

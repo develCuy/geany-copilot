@@ -5,9 +5,18 @@ use std::sync::Mutex;
 pub static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 pub static CURL_TIMEOUT_INDEX: AtomicI32 = AtomicI32::new(DEFAULT_CURL_TIMEOUT_INDEX as i32);
 pub static MAX_TOKENS: AtomicI32 = AtomicI32::new(0);
-/// Whether decoded reasoning is retained and displayed in the sidebar.
+pub const THINKING_LOG_LOCATION_SIDEBAR: i32 = 0;
+pub const THINKING_LOG_LOCATION_MESSAGE_WINDOW: i32 = 1;
+
+/// Whether decoded reasoning is retained and displayed.
 /// Keeping this off avoids allocating a second copy of streamed reasoning.
 pub static THINKING_LOG_ENABLED: AtomicI32 = AtomicI32::new(1);
+/// Placement of the thinking log panel: 0 = Sidebar (default), 1 = Message window.
+pub static THINKING_LOG_LOCATION: AtomicI32 = AtomicI32::new(THINKING_LOG_LOCATION_SIDEBAR);
+
+pub const DEFAULT_THINKING_LOG_MSGWIN_SPLIT: i32 = 90;
+/// Width proportion percentage (20..=95) for Column 1 when displayed in the message window.
+pub static THINKING_LOG_MSGWIN_SPLIT: AtomicI32 = AtomicI32::new(DEFAULT_THINKING_LOG_MSGWIN_SPLIT);
 
 pub static ACTIVE_PRESET_INDEX: AtomicI32 = AtomicI32::new(0);
 

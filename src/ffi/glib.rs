@@ -5,6 +5,7 @@ pub type GChar = c_char;
 pub type GInt = c_int;
 pub type GUint = c_uint;
 pub type GInt64 = c_longlong;
+pub type GDouble = std::os::raw::c_double;
 pub type GPointer = *mut c_void;
 
 pub type GCallback = Option<unsafe extern "C" fn()>;

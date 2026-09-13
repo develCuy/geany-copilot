@@ -8,7 +8,8 @@ use crate::ffi::glib::*;
 use crate::ffi::gtk::*;
 use crate::globals::{
     with_global_state, ACTIVE_PRESET_INDEX, CURL_TIMEOUT_INDEX, MAX_TOKENS,
-    THINKING_LOG_ENABLED,
+    THINKING_LOG_ENABLED, THINKING_LOG_LOCATION, THINKING_LOG_LOCATION_MESSAGE_WINDOW,
+    THINKING_LOG_LOCATION_SIDEBAR,
 };
 use crate::ui::{
     set_thinking_log_enabled, update_statusbar_max_tokens_combo, update_statusbar_preset_combo,
@@ -41,6 +42,8 @@ pub struct ConfigWidgets {
     pub timeout_combo: *mut GtkWidget,
     pub max_tokens_combo: *mut GtkWidget,
     pub thinking_log_check: *mut GtkWidget,
+    pub thinking_log_sidebar_radio: *mut GtkWidget,
+    pub thinking_log_msgwin_radio: *mut GtkWidget,
     pub max_token_values: Vec<i32>,
     pub presets: Vec<BackendPreset>,
     pub active_preset_index: usize,
@@ -228,6 +231,14 @@ pub unsafe fn commit_config_widgets(widgets: &mut ConfigWidgets) {
     ACTIVE_PRESET_INDEX.store(widgets.active_preset_index as i32, Ordering::SeqCst);
     let thinking_log_enabled = gtk_toggle_button_get_active(widgets.thinking_log_check) != 0;
     THINKING_LOG_ENABLED.store(thinking_log_enabled as i32, Ordering::SeqCst);
+    let thinking_log_location = if !widgets.thinking_log_msgwin_radio.is_null()
+        && gtk_toggle_button_get_active(widgets.thinking_log_msgwin_radio) != 0
+    {
+        THINKING_LOG_LOCATION_MESSAGE_WINDOW
+    } else {
+        THINKING_LOG_LOCATION_SIDEBAR
+    };
+    THINKING_LOG_LOCATION.store(thinking_log_location, Ordering::SeqCst);
 
     with_global_state(|state| {
         state.presets = widgets.presets.clone();
@@ -247,7 +258,7 @@ pub unsafe fn commit_config_widgets(widgets: &mut ConfigWidgets) {
     update_statusbar_preset_combo();
     update_statusbar_timeout_combo();
     update_statusbar_max_tokens_combo();
-    // Do this last: disabling the panel can destroy this settings form.
+    // Do this last: disabling or moving the panel can destroy this settings form.
     set_thinking_log_enabled(widgets.plugin, thinking_log_enabled);
 }
 
@@ -612,14 +623,98 @@ pub unsafe extern "C" fn copilot_plugin_configure(
     build_settings_form(plugin, dialog)
 }
 
-/// Creates the same configuration controls for the Copilot right dock.  The
-/// form owns its state until GTK destroys the page, so it remains independent
-/// of Geany's normal Plugin Manager preferences dialog.
-pub unsafe fn create_settings_page(plugin: *mut GeanyPlugin) -> *mut GtkWidget {
-    build_settings_form(plugin, ptr::null_mut())
+/// Shows the Geany Copilot preferences dialog as a modal window.
+pub unsafe fn show_settings_dialog(plugin: *mut GeanyPlugin) {
+    if plugin.is_null() {
+        return;
+    }
+    crate::config::load_config(plugin);
+
+    let parent = if !(*plugin).geany_data.is_null()
+        && !(*(*plugin).geany_data).main_widgets.is_null()
+    {
+        (*(*plugin).geany_data)
+            .main_widgets
+            .as_ref()
+            .map_or(ptr::null_mut(), |main_widgets| (*main_widgets).window)
+    } else {
+        ptr::null_mut()
+    };
+
+    let title = CString::new("Geany Copilot Preferences").unwrap();
+    let cancel_lbl = CString::new("_Cancel").unwrap();
+    let apply_lbl = CString::new("_Apply").unwrap();
+    let ok_lbl = CString::new("_OK").unwrap();
+
+    let dialog = gtk_dialog_new_with_buttons(
+        title.as_ptr(),
+        parent,
+        GTK_DIALOG_MODAL,
+        cancel_lbl.as_ptr(),
+        GTK_RESPONSE_CANCEL,
+        apply_lbl.as_ptr(),
+        GTK_RESPONSE_APPLY,
+        ok_lbl.as_ptr(),
+        GTK_RESPONSE_OK,
+        ptr::null::<c_char>(),
+    );
+    if dialog.is_null() {
+        return;
+    }
+
+    gtk_window_set_default_size(dialog as *mut GtkWindow, 520, 580);
+
+    let form = build_settings_form(plugin, dialog as *mut GtkDialog);
+    let scrolled = gtk_scrolled_window_new(ptr::null_mut(), ptr::null_mut());
+    gtk_scrolled_window_set_policy(
+        scrolled as *mut _,
+        GTK_POLICY_AUTOMATIC,
+        GTK_POLICY_AUTOMATIC,
+    );
+    gtk_container_add(scrolled as *mut _, form);
+
+    let content_area = gtk_dialog_get_content_area(dialog as *mut _);
+    gtk_box_pack_start(content_area as *mut _, scrolled, G_TRUE, G_TRUE, 0);
+
+    gtk_widget_show_all(dialog);
+
+    // Keep the dialog open when the user clicks Apply (the on_configure_response
+    // signal handler commits settings on both Apply and OK).  Close on OK, Cancel,
+    // or window-close.
+    while gtk_dialog_run(dialog as *mut _) == GTK_RESPONSE_APPLY {}
+
+    gtk_widget_destroy(dialog);
 }
 
 unsafe extern "C" fn on_settings_form_destroy(_widget: *mut GtkWidget, _data: GPointer) {}
+
+unsafe fn update_thinking_log_controls_sensitivity(widgets: &ConfigWidgets) {
+    let active = !widgets.thinking_log_check.is_null()
+        && gtk_toggle_button_get_active(widgets.thinking_log_check) != 0;
+    if !widgets.thinking_log_sidebar_radio.is_null() {
+        gtk_widget_set_sensitive(
+            widgets.thinking_log_sidebar_radio,
+            if active { G_TRUE } else { G_FALSE },
+        );
+    }
+    if !widgets.thinking_log_msgwin_radio.is_null() {
+        gtk_widget_set_sensitive(
+            widgets.thinking_log_msgwin_radio,
+            if active { G_TRUE } else { G_FALSE },
+        );
+    }
+}
+
+pub unsafe extern "C" fn on_thinking_log_check_toggled(
+    _check: *mut GtkWidget,
+    user_data: GPointer,
+) {
+    if user_data.is_null() {
+        return;
+    }
+    let widgets = &*(user_data as *mut ConfigWidgets);
+    update_thinking_log_controls_sensitivity(widgets);
+}
 
 unsafe fn build_settings_form(
     plugin: *mut GeanyPlugin,
@@ -721,11 +816,12 @@ unsafe fn build_settings_form(
     );
 
     let thinking_log_check = gtk_check_button_new_with_label(
-        CString::new("Show thinking log in a right-side panel").unwrap().as_ptr(),
+        CString::new("Show thinking log").unwrap().as_ptr(),
     );
+    let thinking_log_enabled = THINKING_LOG_ENABLED.load(Ordering::SeqCst) != 0;
     gtk_toggle_button_set_active(
         thinking_log_check,
-        if THINKING_LOG_ENABLED.load(Ordering::SeqCst) != 0 {
+        if thinking_log_enabled {
             G_TRUE
         } else {
             G_FALSE
@@ -733,9 +829,59 @@ unsafe fn build_settings_form(
     );
     gtk_widget_set_tooltip_text(
         thinking_log_check,
-        CString::new("Capture streamed reasoning in a dedicated right-side panel")
+        CString::new("Capture streamed reasoning and request diagnostics")
             .unwrap()
             .as_ptr(),
+    );
+
+    let thinking_log_sidebar_radio = gtk_radio_button_new_with_label_from_widget(
+        ptr::null_mut(),
+        CString::new("Sidebar").unwrap().as_ptr(),
+    );
+    let thinking_log_msgwin_radio = gtk_radio_button_new_with_label_from_widget(
+        thinking_log_sidebar_radio as *mut _,
+        CString::new("Message window").unwrap().as_ptr(),
+    );
+
+    let thinking_log_location = THINKING_LOG_LOCATION.load(Ordering::SeqCst);
+    if thinking_log_location == THINKING_LOG_LOCATION_MESSAGE_WINDOW {
+        gtk_toggle_button_set_active(thinking_log_msgwin_radio as *mut _, G_TRUE);
+    } else {
+        gtk_toggle_button_set_active(thinking_log_sidebar_radio as *mut _, G_TRUE);
+    }
+
+    gtk_widget_set_sensitive(
+        thinking_log_sidebar_radio,
+        if thinking_log_enabled { G_TRUE } else { G_FALSE },
+    );
+    gtk_widget_set_sensitive(
+        thinking_log_msgwin_radio,
+        if thinking_log_enabled { G_TRUE } else { G_FALSE },
+    );
+    gtk_widget_set_tooltip_text(
+        thinking_log_sidebar_radio,
+        CString::new("Show thinking log in a dedicated right-side sidebar").unwrap().as_ptr(),
+    );
+    gtk_widget_set_tooltip_text(
+        thinking_log_msgwin_radio,
+        CString::new("Show thinking log in a bottom message window tab").unwrap().as_ptr(),
+    );
+
+    let thinking_log_loc_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    gtk_widget_set_margin_start(thinking_log_loc_box, 20);
+    gtk_box_pack_start(
+        thinking_log_loc_box as *mut _,
+        thinking_log_sidebar_radio,
+        G_FALSE,
+        G_FALSE,
+        0,
+    );
+    gtk_box_pack_start(
+        thinking_log_loc_box as *mut _,
+        thinking_log_msgwin_radio,
+        G_FALSE,
+        G_FALSE,
+        0,
     );
 
     let limits_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
@@ -780,6 +926,7 @@ unsafe fn build_settings_form(
     gtk_box_pack_start(box_widget as *mut _, insert_mode_combo, G_FALSE, G_FALSE, 0);
     gtk_box_pack_start(box_widget as *mut _, system_prompt_btn, G_FALSE, G_FALSE, 0);
     gtk_box_pack_start(box_widget as *mut _, thinking_log_check, G_FALSE, G_FALSE, 0);
+    gtk_box_pack_start(box_widget as *mut _, thinking_log_loc_box, G_FALSE, G_FALSE, 0);
     gtk_box_pack_start(box_widget as *mut _, limits_box, G_FALSE, G_FALSE, 0);
 
     let mut widgets = Box::new(ConfigWidgets {
@@ -799,6 +946,8 @@ unsafe fn build_settings_form(
         timeout_combo,
         max_tokens_combo,
         thinking_log_check,
+        thinking_log_sidebar_radio,
+        thinking_log_msgwin_radio,
         max_token_values: Vec::new(),
         presets: Vec::new(),
         active_preset_index: 0,
@@ -820,6 +969,15 @@ unsafe fn build_settings_form(
     let c_changed = CString::new("changed").unwrap();
     let c_toggled = CString::new("toggled").unwrap();
     let c_response = CString::new("response").unwrap();
+
+    g_signal_connect_data(
+        thinking_log_check as GPointer,
+        c_toggled.as_ptr(),
+        Some(std::mem::transmute::<unsafe extern "C" fn(*mut GtkWidget, GPointer), unsafe extern "C" fn()>(on_thinking_log_check_toggled)),
+        widgets_ptr as GPointer,
+        None,
+        0,
+    );
 
     g_signal_connect_data(
         preset_combo as GPointer,
@@ -962,6 +1120,8 @@ mod tests {
             timeout_combo: ptr::null_mut(),
             max_tokens_combo: ptr::null_mut(),
             thinking_log_check: ptr::null_mut(),
+            thinking_log_sidebar_radio: ptr::null_mut(),
+            thinking_log_msgwin_radio: ptr::null_mut(),
             max_token_values: Vec::new(),
             presets: Vec::new(),
             active_preset_index: 0,
@@ -974,6 +1134,7 @@ mod tests {
         unsafe {
             assert_eq!(safe_get_entry_text(ptr::null_mut()), "");
             assert_eq!(get_text_buffer_text(ptr::null_mut()), "");
+            on_thinking_log_check_toggled(ptr::null_mut(), ptr::null_mut());
         }
     }
 
@@ -1015,6 +1176,13 @@ mod tests {
             let boxed = Box::new(empty_widgets());
             free_config_widgets(Box::into_raw(boxed) as GPointer);
             on_settings_form_destroy(ptr::null_mut(), ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn show_settings_dialog_handles_null_plugin() {
+        unsafe {
+            show_settings_dialog(ptr::null_mut());
         }
     }
 }
